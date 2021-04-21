@@ -30,13 +30,17 @@ use libp2p::{
     yamux::YamuxConfig,
     PeerId, Swarm, Transport,
 };
-use libp2p_tokio_socks5::Socks5TokioTcpConfig;
+use libp2p_ping_pong_tor::tor;
+use libp2p_ping_pong_tor::tor::AuthenticatedConnection;
+use libp2p_ping_pong_tor::tor_socks::Socks5TokioTcpConfig;
 use log::warn;
 use structopt::StructOpt;
+use torut::onion::TorSecretKeyV3;
 
 /// The ping-pong onion service address.
 const ONION: &str = "/onion3/qfbbkwp3lutbzismudbjjfumasypnymzlnarrs3vcw7isnrrwyhv4uad:7776";
 const LOCAL_PORT: u16 = 7777;
+const TOR_PORT: u16 = 7776;
 
 /// Tor should be started with a hidden service configured. Add the following to
 /// your torrc
@@ -65,7 +69,8 @@ async fn main() -> Result<()> {
     if opt.dialer {
         run_dialer(addr).await?;
     } else {
-        run_listener(addr).await?;
+        let _ac = register_tor_service().await?;
+        run_listener().await?;
     }
 
     Ok(())
@@ -109,7 +114,7 @@ async fn run_dialer(addr: Multiaddr) -> Result<()> {
 }
 
 /// Entry point to run the ping-pong application as a listener.
-async fn run_listener(_onion: Multiaddr) -> Result<()> {
+async fn run_listener() -> Result<()> {
     let local_address = format!("{}{}", "/ip4/127.0.0.1/tcp/", LOCAL_PORT)
         .parse::<Multiaddr>()
         .unwrap();
@@ -176,6 +181,21 @@ fn build_transport(id_keys: Keypair) -> anyhow::Result<PingPongTransport> {
         .boxed();
 
     Ok(transport)
+}
+
+/// registers an hidden service. Once ac goes out of scope, the service will be de-registered.
+async fn register_tor_service() -> Result<AuthenticatedConnection> {
+    let uac = tor::UnauthenticatedConnection::default();
+    let mut ac = uac.into_authenticated_connection().await?;
+    let key = TorSecretKeyV3::generate();
+    ac.add_service(LOCAL_PORT, TOR_PORT, &key).await?;
+    let onion_address = key
+        .public()
+        .get_onion_address()
+        .get_address_without_dot_onion();
+
+    log::info!("/onion3/{}:{}", onion_address, TOR_PORT);
+    Ok(ac)
 }
 
 /// libp2p `Transport` for the ping-pong application.
