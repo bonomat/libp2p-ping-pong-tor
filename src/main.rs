@@ -40,7 +40,7 @@ use torut::onion::TorSecretKeyV3;
 /// The ping-pong onion service address.
 const ONION: &str = "/onion3/qfbbkwp3lutbzismudbjjfumasypnymzlnarrs3vcw7isnrrwyhv4uad:7776";
 const LOCAL_PORT: u16 = 7777;
-const TOR_PORT: u16 = 7776;
+const TOR_PORT: u16 = 7777;
 
 /// Tor should be started with a hidden service configured. Add the following to
 /// your torrc
@@ -115,7 +115,7 @@ async fn run_dialer(addr: Multiaddr) -> Result<()> {
 
 /// Entry point to run the ping-pong application as a listener.
 async fn run_listener() -> Result<()> {
-    let local_address = format!("{}{}", "/ip4/127.0.0.1/tcp/", LOCAL_PORT)
+    let local_address = format!("{}{}", "/ip4/0.0.0.0/tcp/", LOCAL_PORT)
         .parse::<Multiaddr>()
         .unwrap();
 

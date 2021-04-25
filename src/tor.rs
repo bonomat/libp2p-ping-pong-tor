@@ -1,69 +1,52 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::str::FromStr;
 use tokio::net::TcpStream;
 use torut::control::{AsyncEvent, AuthenticatedConn, ConnError, UnauthenticatedConn};
 use torut::onion::TorSecretKeyV3;
 
+pub const DEFAULT_CONTROL_PORT: u16 = 9051;
+
 #[derive(Debug, Clone, Copy)]
 pub struct UnauthenticatedConnection {
-    tor_proxy_address: SocketAddrV4,
-    tor_control_port_address: SocketAddr,
+    control_port_address: SocketAddr,
 }
 
 impl Default for UnauthenticatedConnection {
     fn default() -> Self {
         Self {
-            tor_proxy_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9050),
-            tor_control_port_address: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9051)),
+            control_port_address: SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                DEFAULT_CONTROL_PORT,
+            )),
         }
     }
 }
 
 impl UnauthenticatedConnection {
-    pub fn with_ports(proxy_port: u16, control_port: u16) -> Self {
+    pub fn with_control_port(self, control_port: u16) -> Self {
         Self {
-            tor_proxy_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, proxy_port),
-            tor_control_port_address: SocketAddr::V4(SocketAddrV4::new(
+            control_port_address: SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::LOCALHOST,
                 control_port,
             )),
         }
     }
 
-    /// checks if tor is running
-    async fn assert_tor_running(&self) -> Result<()> {
-        // Make sure you are running tor and this is your socks port
-        let proxy = reqwest::Proxy::all(format!("socks5h://{}", self.tor_proxy_address).as_str())
-            .map_err(|_| anyhow!("tor proxy should be there"))?;
-        let client = reqwest::Client::builder().proxy(proxy).build()?;
-
-        let res = client.get("https://check.torproject.org").send().await?;
-        let text = res.text().await?;
-
-        if !text.contains("Congratulations. This browser is configured to use Tor.") {
-            log::debug!("Found text: \n{}", text);
-            bail!("Tor is currently not running")
-        }
-
-        Ok(())
-    }
-
     async fn init_unauthenticated_connection(&self) -> Result<UnauthenticatedConn<TcpStream>> {
         // Connect to local tor service via control port
-        let sock = TcpStream::connect(self.tor_control_port_address).await?;
+        let sock = TcpStream::connect(self.control_port_address).await?;
         let uc = UnauthenticatedConn::new(sock);
         Ok(uc)
     }
 
     /// Create a new authenticated connection to your local Tor service
     pub async fn into_authenticated_connection(self) -> Result<AuthenticatedConnection> {
-        self.assert_tor_running().await?;
-
         let mut uc = self
             .init_unauthenticated_connection()
             .await
-            .map_err(|_| anyhow!("Tor instance not running."))?;
+            .map_err(|_| anyhow!("Could not connect to Tor. Tor might not be running or the control port is incorrect."))?;
 
         let tor_info = uc
             .load_protocol_info()
@@ -72,7 +55,7 @@ impl UnauthenticatedConnection {
 
         let tor_auth_data = tor_info
             .make_auth_data()?
-            .ok_or_else(|| anyhow!("Failed to make auth data."))?;
+            .context("Failed to make Tor auth data.")?;
 
         // Get an authenticated connection to the Tor via the Tor Controller protocol.
         uc.authenticate(&tor_auth_data)
@@ -80,7 +63,7 @@ impl UnauthenticatedConnection {
             .map_err(|_| anyhow!("Failed to authenticate with Tor"))?;
 
         Ok(AuthenticatedConnection {
-            authenticated_connection: uc.into_authenticated().await,
+            inner: uc.into_authenticated().await,
         })
     }
 }
@@ -89,18 +72,20 @@ type Handler = fn(AsyncEvent<'_>) -> Box<dyn Future<Output = Result<(), ConnErro
 
 #[allow(missing_debug_implementations)]
 pub struct AuthenticatedConnection {
-    authenticated_connection: AuthenticatedConn<TcpStream, Handler>,
+    inner: AuthenticatedConn<TcpStream, Handler>,
 }
 
 impl AuthenticatedConnection {
     /// Add an ephemeral tor service on localhost with the provided key
+    /// `service_port` and `onion_port` can be different but don't have to as
+    /// they are on different networks.
     pub async fn add_service(
         &mut self,
         service_port: u16,
         onion_port: u16,
         tor_key: &TorSecretKeyV3,
     ) -> Result<()> {
-        self.authenticated_connection
+        self.inner
             .add_onion_v3(
                 tor_key,
                 false,
@@ -116,41 +101,55 @@ impl AuthenticatedConnection {
             .await
             .map_err(|e| anyhow!("Could not add onion service.: {:#?}", e))
     }
-}
 
-#[derive(Copy, Clone, Debug)]
-pub struct TorConf {
-    pub control_port: u16,
-    pub proxy_port: u16,
-    pub service_port: u16,
-}
+    /// Add ephemeral services for provided services with the same key.
+    pub async fn add_services(
+        &mut self,
+        services: &[(u16, SocketAddr)],
+        tor_key: &TorSecretKeyV3,
+    ) -> Result<()> {
+        let mut listeners = services.iter();
+        self.inner
+            .add_onion_v3(tor_key, false, false, false, None, &mut listeners)
+            .await
+            .map_err(|e| anyhow!("Could not add onion service.: {:#?}", e))
+    }
 
-impl Default for TorConf {
-    fn default() -> Self {
-        Self {
-            control_port: 9051,
-            proxy_port: 9050,
-            service_port: 9090,
+    /// Reads socks5 address via control port.
+    /// Returns the address if retrieved successfully and if Tor is running
+    /// correctly.
+    pub async fn socks5_address(&mut self) -> Result<SocketAddrV4> {
+        let socks_address_str = self
+            .inner
+            .get_info("net/listeners/socks")
+            .await
+            .map_err(|e| anyhow!("Could not get socks5 details.: {:#?}", e))?
+            .replace("\"", "");
+        log::debug!("Received socks5 address: {}", socks_address_str);
+        let socks5_address = SocketAddr::from_str(socks_address_str.as_str())
+            .context("Could not parse socks5 address")?;
+        match socks5_address {
+            SocketAddr::V4(address) => Ok(address),
+            SocketAddr::V6(_) => {
+                bail!("We do not support IPv6 atm.")
+            }
         }
     }
 }
 
-impl TorConf {
-    pub fn with_control_port(self, control_port: u16) -> Self {
-        Self {
-            control_port,
-            ..self
-        }
+/// checks if tor is running on localhost under the provided port
+pub async fn assert_tor_running(socks5_address: SocketAddrV4) -> Result<()> {
+    // Make sure you are running tor and this is your socks port
+    let proxy = reqwest::Proxy::all(format!("socks5h://{}", socks5_address).as_str())
+        .map_err(|_| anyhow!("Tor proxy should be there"))?;
+    let client = reqwest::Client::builder().proxy(proxy).build()?;
+
+    let res = client.get("https://check.torproject.org").send().await?;
+    let text = res.text().await?;
+
+    if !text.contains("Congratulations. This browser is configured to use Tor.") {
+        bail!("Tor is currently not running")
     }
 
-    pub fn with_proxy_port(self, proxy_port: u16) -> Self {
-        Self { proxy_port, ..self }
-    }
-
-    pub fn with_service_port(self, service_port: u16) -> Self {
-        Self {
-            service_port,
-            ..self
-        }
-    }
+    Ok(())
 }

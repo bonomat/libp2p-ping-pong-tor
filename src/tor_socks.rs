@@ -61,21 +61,21 @@ impl Transport for Socks5TokioTcpConfig {
     }
 
     fn dial(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
-        let dest =
-            tor_address_string(addr.clone()).ok_or(TransportError::MultiaddrNotSupported(addr))?;
-        debug!("Tor destination address: {}", dest);
-
         async fn do_dial(cfg: Socks5TokioTcpConfig, dest: String) -> Result<TcpStream, io::Error> {
-            info!("Connecting to Tor proxy ...");
+            info!("Connecting via Tor proxy ...");
             let stream = connect_to_socks_proxy(dest, cfg.socks_port)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
             info!("Connection established");
-
             Ok(stream)
         }
-
-        Ok(Box::pin(do_dial(self, dest)))
+        if let Some(dest) = to_onion_address(addr.clone()) {
+            info!("Dialling via Tor to: {}", dest);
+            Ok(Box::pin(do_dial(self, dest)))
+        } else {
+            info!("Dialling via clear net to: {}", addr);
+            self.inner.dial(addr)
+        }
     }
 
     fn address_translation(&self, listen: &Multiaddr, observed: &Multiaddr) -> Option<Multiaddr> {
@@ -83,18 +83,77 @@ impl Transport for Socks5TokioTcpConfig {
     }
 }
 
-// Tor expects address in form: ADDR.onion:PORT
-fn tor_address_string(mut multi: Multiaddr) -> Option<String> {
-    let (encoded, port) = match multi.pop()? {
-        Protocol::Onion(addr, port) => {
-            log::warn!("Onion service v2 is being deprecated, consider upgrading to v3");
-            (BASE32.encode(addr.as_ref()), port)
+/// iterates through multi address until we have onion protocol, else return
+/// None Tor expects address in form: ADDR.onion:PORT or ADDR:PORT
+fn to_onion_address(multi: Multiaddr) -> Option<String> {
+    let components = multi.iter();
+    for protocol in components {
+        match protocol {
+            Protocol::Onion(addr, port) => {
+                log::warn!("Onion service v2 is being deprecated, consider upgrading to v3");
+                return Some(format!(
+                    "{}.onion:{}",
+                    BASE32.encode(addr.as_ref()).to_lowercase(),
+                    port
+                ));
+            }
+            Protocol::Onion3(addr) => {
+                return Some(format!(
+                    "{}.onion:{}",
+                    BASE32.encode(addr.hash()).to_lowercase(),
+                    addr.port()
+                ));
+            }
+            _ => {
+                // ignore
+            }
         }
-        Protocol::Onion3(addr) => (BASE32.encode(addr.hash()), addr.port()),
-        _ => return None,
-    };
-    let addr = format!("{}.onion:{}", encoded.to_lowercase(), port);
-    Some(addr)
+    }
+
+    // Deal with non-onion addresses
+    let protocols = multi.iter().collect::<Vec<_>>();
+    let address_string = protocols
+        .iter()
+        .filter_map(|protocol| match protocol {
+            Protocol::Ip4(addr) => Some(format!("{}", addr)),
+            Protocol::Ip6(addr) => Some(format!("{}", addr)),
+            Protocol::Dns(addr) => Some(format!("{}", addr)),
+            Protocol::Dns4(addr) => Some(format!("{}", addr)),
+            Protocol::Dns6(addr) => Some(format!("{}", addr)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if address_string.is_empty() {
+        return None;
+    }
+
+    let mut address_string = address_string
+        .get(0)
+        .expect("Valid multiaddr consist only out of 1 address")
+        .clone();
+    let port = protocols
+        .iter()
+        .filter_map(|protocol| match protocol {
+            Protocol::Sctp(port) => Some(format!("{}", port)),
+            Protocol::Tcp(port) => Some(format!("{}", port)),
+            Protocol::Udp(port) => Some(format!("{}", port)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if port.len() > 1 {
+        log::warn!("This should not happen :D ")
+    } else if port.len() == 1 {
+        address_string.push_str(
+            format!(
+                ":{}",
+                port.get(0)
+                    .expect("Already verified the length of the vec.")
+            )
+            .as_str(),
+        )
+    }
+
+    Some(address_string.clone())
 }
 
 /// Connect to the SOCKS5 proxy socket.
@@ -105,4 +164,61 @@ async fn connect_to_socks_proxy<'a>(
     let sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let stream = Socks5Stream::connect(sock, dest).await?;
     Ok(TcpStream(stream.into_inner()))
+}
+
+#[cfg(test)]
+pub mod test {
+    use crate::tor_socks::to_onion_address;
+
+    #[test]
+    fn test_tor_address_string() {
+        let address =
+            "/onion3/oarchy4tamydxcitaki6bc2v4leza6v35iezmu2chg2bap63sv6f2did:1024/p2p/12D3KooWPD4uHN74SHotLN7VCH7Fm8zZgaNVymYcpeF1fpD2guc9"
+            ;
+        let address_base32 = to_onion_address(address.parse().unwrap())
+            .expect("To be a multi address formatted to base32 ");
+        assert_eq!(
+            address_base32,
+            "oarchy4tamydxcitaki6bc2v4leza6v35iezmu2chg2bap63sv6f2did.onion:1024"
+        );
+    }
+
+    #[test]
+    fn tcp_to_address_string_should_be_some() {
+        let address = "/ip4/127.0.0.1/tcp/7777";
+        let address_string =
+            to_onion_address(address.parse().unwrap()).expect("To be a multi address formatted. ");
+        assert_eq!(address_string, "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn udp_to_address_string_should_be_some() {
+        let address = "/ip4/127.0.0.1/udp/7777";
+        let address_string =
+            to_onion_address(address.parse().unwrap()).expect("To be a multi address formatted. ");
+        assert_eq!(address_string, "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn ws_to_address_string_should_be_some() {
+        let address = "/ip4/127.0.0.1/tcp/7777/ws";
+        let address_string =
+            to_onion_address(address.parse().unwrap()).expect("To be a multi address formatted. ");
+        assert_eq!(address_string, "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn scpt_to_address_string_should_be_some() {
+        let address = "/ip4/127.0.0.1/sctp/7777";
+        let address_string =
+            to_onion_address(address.parse().unwrap()).expect("To be a multi address formatted. ");
+        assert_eq!(address_string, "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn dnsaddr_to_address_string_should_be_none() {
+        let address = "/dnsaddr/xmr-btc-asb.coblox.tech";
+        let address_string = to_onion_address(address.parse().unwrap());
+        assert_eq!(address_string, None);
+    }
 }
